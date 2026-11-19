@@ -274,7 +274,7 @@ sees the mapped status:
 
 | Upstream | Client sees |
 | --- | --- |
-| Queue notice, code `10605`, or a queue object with `isQueued` / `serviceAvailable` | `503` with `Retry-After` (from `retryAfterSeconds`, 30 by default) |
+| Queue notice, code `10605`, `RESOURCE_LIMIT`, or a queue payload with `isQueued` / `serviceAvailable` (including nested JSON envelopes) | `503` with `Retry-After` (from `retryAfterSeconds`, `waitTime`, or `Retry-After` header; 30 by default) |
 | Codes `110`, `112` to `119`, `122` | `429` |
 | Codes `406`, `416`, `430`, `80411`, `80412`, `100400`, `100401`, `100403` | `400` |
 | Code `145` / `MODEL_PAID_CONFIRM_REQUIRED`, QoDuck's daily free allowance used up | `429`, model-scoped |

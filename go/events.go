@@ -18,6 +18,9 @@ import (
 // carrying another code is something else (a queued request, a refused input).
 const (
 	queuedCode = "10605"
+	// resourceLimitSubCode is Qoder's queue / resource-limit qualifier carried in
+	// subCode when a request is queued or throttled under a 403 frame.
+	resourceLimitSubCode = "RESOURCE_LIMIT"
 
 	// allowanceCode is QoDuck's daily free allowance running out: Qoder offers to
 	// continue at normal model prices using credits, which the plugin cannot
@@ -26,6 +29,10 @@ const (
 	allowanceCode = "145"
 	// paidConfirmSubCode names that same refusal when Qoder spells it in subCode.
 	paidConfirmSubCode = "MODEL_PAID_CONFIRM_REQUIRED"
+
+	// maxFailureUnwrapDepth bounds how many nested JSON envelopes or stringified
+	// JSON messages classifyUpstream peels back.
+	maxFailureUnwrapDepth = 5
 )
 
 var quotaCodes = map[string]bool{"110": true, "112": true, "113": true, "114": true, "115": true, "116": true, "117": true, "118": true, "119": true, "122": true}
@@ -77,21 +84,218 @@ func failureCode(f *qoderFailure) string {
 	}
 }
 
+// queuePayload carries Qoder's queue state, whether nested under "queue" or
+// flattened inside a stringified inner message.
+type queuePayload struct {
+	IsQueued          *bool    `json:"isQueued"`
+	ServiceAvailable  *bool    `json:"serviceAvailable"`
+	RetryAfterSeconds *float64 `json:"retryAfterSeconds"`
+	WaitTime          *float64 `json:"waitTime"`
+	QueueCount        *float64 `json:"queueCount"`
+	QueueType         string   `json:"queueType"`
+	ModelKey          string   `json:"modelKey"`
+}
+
+func (q *queuePayload) hasSignal() bool {
+	if q == nil {
+		return false
+	}
+	return q.IsQueued != nil || q.ServiceAvailable != nil ||
+		q.RetryAfterSeconds != nil || q.WaitTime != nil ||
+		q.QueueCount != nil || q.QueueType != "" || q.ModelKey != ""
+}
+
+func (q *queuePayload) isQueuedOrUnavailable() bool {
+	if q == nil {
+		return false
+	}
+	return (q.IsQueued != nil && *q.IsQueued) || (q.ServiceAvailable != nil && !*q.ServiceAvailable)
+}
+
+func (q *queuePayload) retrySeconds() int {
+	if q == nil {
+		return 0
+	}
+	if q.RetryAfterSeconds != nil && *q.RetryAfterSeconds > 0 {
+		return int(*q.RetryAfterSeconds)
+	}
+	if q.WaitTime != nil && *q.WaitTime > 0 {
+		return int(*q.WaitTime)
+	}
+	return 0
+}
+
+func mergeQueue(dst, src *queuePayload) *queuePayload {
+	if src == nil || !src.hasSignal() {
+		return dst
+	}
+	out := &queuePayload{}
+	if dst != nil {
+		*out = *dst
+	}
+	if src.IsQueued != nil {
+		v := *src.IsQueued
+		out.IsQueued = &v
+	}
+	if src.ServiceAvailable != nil {
+		v := *src.ServiceAvailable
+		out.ServiceAvailable = &v
+	}
+	if src.RetryAfterSeconds != nil {
+		v := *src.RetryAfterSeconds
+		out.RetryAfterSeconds = &v
+	}
+	if src.WaitTime != nil {
+		v := *src.WaitTime
+		out.WaitTime = &v
+	}
+	if src.QueueCount != nil {
+		v := *src.QueueCount
+		out.QueueCount = &v
+	}
+	if qt := strings.TrimSpace(src.QueueType); qt != "" {
+		out.QueueType = qt
+	}
+	if mk := strings.TrimSpace(src.ModelKey); mk != "" {
+		out.ModelKey = mk
+	}
+	return out
+}
+
 // classification bodies: Qoder's code says what a failure is.
 type failureBody struct {
 	Code    json.RawMessage `json:"code"`
 	Message string          `json:"message"`
-	// SubCode qualifies Code: 145's paid-confirmation offer is spelled here.
+	// SubCode qualifies Code: 145's paid-confirmation offer and 10605's
+	// RESOURCE_LIMIT queue notice are spelled here.
 	SubCode string          `json:"subCode"`
 	Details json.RawMessage `json:"details"`
-	Queue   *struct {
-		IsQueued          *bool    `json:"isQueued"`
-		ServiceAvailable  *bool    `json:"serviceAvailable"`
-		RetryAfterSeconds *float64 `json:"retryAfterSeconds"`
-		QueueCount        *float64 `json:"queueCount"`
-		QueueType         string   `json:"queueType"`
-		ModelKey          string   `json:"modelKey"`
-	} `json:"queue"`
+	Error   json.RawMessage `json:"error"`
+	Queue   *queuePayload   `json:"queue"`
+	// Envelope fields when an upstream HTTP response or SSE frame is passed whole.
+	StatusCodeValue *int                `json:"statusCodeValue"`
+	Headers         map[string][]string `json:"headers"`
+	Body            string              `json:"body"`
+	// Inline queue fields when Qoder serializes the queue state directly inside
+	// a nested message JSON string.
+	IsQueued          *bool    `json:"isQueued"`
+	ServiceAvailable  *bool    `json:"serviceAvailable"`
+	RetryAfterSeconds *float64 `json:"retryAfterSeconds"`
+	WaitTime          *float64 `json:"waitTime"`
+	QueueCount        *float64 `json:"queueCount"`
+	QueueType         string   `json:"queueType"`
+	ModelKey          string   `json:"modelKey"`
+}
+
+func normalizeHeaders(raw map[string][]string) http.Header {
+	if len(raw) == 0 {
+		return nil
+	}
+	h := make(http.Header, len(raw))
+	for k, vals := range raw {
+		for _, v := range vals {
+			h.Add(k, v)
+		}
+	}
+	return h
+}
+
+func mergeHeaders(base http.Header, extra map[string][]string) http.Header {
+	if len(extra) == 0 {
+		return base
+	}
+	merged := make(http.Header, len(base)+len(extra))
+	for k, vals := range base {
+		merged[http.CanonicalHeaderKey(k)] = append([]string(nil), vals...)
+	}
+	for k, vals := range extra {
+		ck := http.CanonicalHeaderKey(k)
+		if len(merged[ck]) == 0 {
+			merged[ck] = append([]string(nil), vals...)
+		}
+	}
+	return merged
+}
+
+type parsedFailure struct {
+	code    string
+	subCode string
+	message string
+	queue   *queuePayload
+	headers http.Header
+}
+
+// parseFailure peels back nested JSON envelopes and stringified JSON message
+// fields (up to maxFailureUnwrapDepth layers) and merges the innermost code,
+// subCode, queue state, message and headers.
+func parseFailure(headers http.Header, body []byte) parsedFailure {
+	out := parsedFailure{
+		message: strings.TrimSpace(string(body)),
+		headers: headers,
+	}
+	current := bytes.TrimSpace(body)
+	for depth := 0; depth < maxFailureUnwrapDepth; depth++ {
+		if len(current) == 0 || current[0] != '{' {
+			break
+		}
+		var layer failureBody
+		if json.Unmarshal(current, &layer) != nil {
+			break
+		}
+		out.headers = mergeHeaders(out.headers, layer.Headers)
+		if c := rawCode(layer.Code); c != "" && (c != "0" || out.code == "") {
+			out.code = c
+		}
+		if sc := strings.TrimSpace(layer.SubCode); sc != "" {
+			out.subCode = sc
+		}
+		out.queue = mergeQueue(out.queue, layer.Queue)
+		inline := &queuePayload{
+			IsQueued:          layer.IsQueued,
+			ServiceAvailable:  layer.ServiceAvailable,
+			RetryAfterSeconds: layer.RetryAfterSeconds,
+			WaitTime:          layer.WaitTime,
+			QueueCount:        layer.QueueCount,
+			QueueType:         strings.TrimSpace(layer.QueueType),
+			ModelKey:          strings.TrimSpace(layer.ModelKey),
+		}
+		if inline.hasSignal() {
+			out.queue = mergeQueue(out.queue, inline)
+		}
+		if b := strings.TrimSpace(layer.Body); b != "" {
+			out.message = b
+			if strings.HasPrefix(b, "{") {
+				current = []byte(b)
+				continue
+			}
+			break
+		}
+		if m := strings.TrimSpace(layer.Message); m != "" {
+			if strings.HasPrefix(m, "{") && json.Valid([]byte(m)) {
+				out.message = m
+				current = []byte(m)
+				continue
+			}
+			out.message = m
+			if len(layer.Details) > 0 {
+				var details struct {
+					Error struct {
+						Message string `json:"message"`
+					} `json:"error"`
+				}
+				if json.Unmarshal(layer.Details, &details) == nil && details.Error.Message != "" {
+					out.message += ": " + details.Error.Message
+				}
+			}
+			break
+		}
+		if errObj := bytes.TrimSpace(layer.Error); len(errObj) > 0 && errObj[0] == '{' {
+			current = errObj
+			continue
+		}
+		break
+	}
+	return out
 }
 
 func rawCode(raw json.RawMessage) string {
@@ -115,67 +319,39 @@ func classifyUpstream(status int, headers http.Header, body []byte) *qoderFailur
 	if status < 400 || status > 599 {
 		status = 502
 	}
-	text := strings.TrimSpace(string(body))
-	message := text
-	code := ""
-	subCode := ""
-	var parsed failureBody
-	if json.Unmarshal(body, &parsed) == nil {
-		if parsed.Message != "" {
-			message = parsed.Message
-		}
-		code = rawCode(parsed.Code)
-		subCode = strings.TrimSpace(parsed.SubCode)
-		if len(parsed.Details) > 0 {
-			var details struct {
-				Error struct {
-					Message string `json:"message"`
-				} `json:"error"`
-			}
-			if json.Unmarshal(parsed.Details, &details) == nil && details.Error.Message != "" {
-				message += ": " + details.Error.Message
-			}
-		}
-		if parsed.Queue != nil && (parsed.Queue.IsQueued != nil && *parsed.Queue.IsQueued || parsed.Queue.ServiceAvailable != nil && !*parsed.Queue.ServiceAvailable) {
-			wait := 30
-			if parsed.Queue.RetryAfterSeconds != nil && *parsed.Queue.RetryAfterSeconds > 0 {
-				wait = int(*parsed.Queue.RetryAfterSeconds)
-			}
-			what := "is busy"
-			if parsed.Queue.IsQueued != nil && *parsed.Queue.IsQueued {
-				what = "queued the request"
-			}
-			model := ""
-			if parsed.Queue.ModelKey != "" {
-				model = " for " + parsed.Queue.ModelKey
-			}
-			return &qoderFailure{Status: 503, Code: queuedCode, Message: fmt.Sprintf("Qoder %s%s; try again in %ds", what, model, wait), RetryAfter: wait, Queue: true}
-		}
-	} else {
-		var env struct {
-			StatusCodeValue *int   `json:"statusCodeValue"`
-			Body            string `json:"body"`
-		}
-		if json.Unmarshal(body, &env) == nil && env.Body != "" {
-			message = strings.TrimSpace(env.Body)
-			if code == "" {
-				var inner failureBody
-				if json.Unmarshal([]byte(env.Body), &inner) == nil {
-					code = rawCode(inner.Code)
-					subCode = strings.TrimSpace(inner.SubCode)
-					if inner.Message != "" {
-						message = inner.Message
-					}
-				}
-			}
-		}
-	}
+	parsed := parseFailure(headers, body)
+	message := parsed.message
+	code := parsed.code
+	subCode := parsed.subCode
 	if message == "" {
 		message = http.StatusText(status)
 	}
-	hint := retryAfterHint(headers)
-	if code == queuedCode {
-		return &qoderFailure{Status: 503, Code: code, Message: "Qoder queued the request; try again shortly", RetryAfter: 30, Queue: true}
+	hint := retryAfterHint(parsed.headers)
+	if parsed.queue.isQueuedOrUnavailable() || code == queuedCode || strings.EqualFold(subCode, resourceLimitSubCode) {
+		wait := parsed.queue.retrySeconds()
+		if wait <= 0 {
+			wait = hint
+		}
+		hasExplicitWait := wait > 0
+		if wait <= 0 {
+			wait = 30
+		}
+		outCode := code
+		if outCode == "" || outCode == "401" || outCode == "403" || outCode == "429" || outCode == "503" {
+			outCode = queuedCode
+		}
+		if !parsed.queue.isQueuedOrUnavailable() && !hasExplicitWait {
+			return &qoderFailure{Status: 503, Code: outCode, Message: "Qoder queued the request; try again shortly", RetryAfter: wait, Queue: true}
+		}
+		what := "queued the request"
+		if parsed.queue != nil && parsed.queue.ServiceAvailable != nil && !*parsed.queue.ServiceAvailable && (parsed.queue.IsQueued == nil || !*parsed.queue.IsQueued) {
+			what = "is busy"
+		}
+		model := ""
+		if parsed.queue != nil && parsed.queue.ModelKey != "" {
+			model = " for " + parsed.queue.ModelKey
+		}
+		return &qoderFailure{Status: 503, Code: outCode, Message: fmt.Sprintf("Qoder %s%s; try again in %ds", what, model, wait), RetryAfter: wait, Queue: true}
 	}
 	// QoDuck's free allowance is per model and per day, and Qoder answers its end
 	// with a 403 that asks the account to confirm paid usage. It stays
@@ -221,6 +397,14 @@ func retryAfterHint(headers http.Header) int {
 	value := ""
 	if headers != nil {
 		value = strings.TrimSpace(headers.Get("Retry-After"))
+		if value == "" {
+			for k, vals := range headers {
+				if strings.EqualFold(k, "Retry-After") && len(vals) > 0 {
+					value = strings.TrimSpace(vals[0])
+					break
+				}
+			}
+		}
 	}
 	if value == "" {
 		return 0
@@ -419,8 +603,9 @@ func (q *qoderEvents) pieces(found []callPiece) ([]qoderEvent, bool) {
 }
 
 type sseFrame struct {
-	StatusCodeValue *int   `json:"statusCodeValue"`
-	Body            string `json:"body"`
+	StatusCodeValue *int                `json:"statusCodeValue"`
+	Headers         map[string][]string `json:"headers"`
+	Body            string              `json:"body"`
 }
 
 type streamDelta struct {
@@ -478,7 +663,7 @@ func (q *qoderEvents) line(line string) []qoderEvent {
 			body = payload
 		}
 		q.closed = true
-		return []qoderEvent{{Err: classifyUpstream(*frame.StatusCodeValue, nil, []byte(body))}}
+		return []qoderEvent{{Err: classifyUpstream(*frame.StatusCodeValue, normalizeHeaders(frame.Headers), []byte(body))}}
 	}
 	if inner == "" {
 		return nil

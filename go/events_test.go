@@ -3,10 +3,14 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"net/http"
 	"reflect"
 	"strings"
 	"testing"
+
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginabi"
 )
 
 // eventsTestTools is the request's declarations as a client sends them: what a
@@ -423,5 +427,136 @@ func TestPaidConfirmOfferIsAnAllowanceNotALapsedSignIn(t *testing.T) {
 	}
 	if !strings.Contains(strings.ToLower(f.Message), "daily allowance") {
 		t.Fatalf("message = %q", f.Message)
+	}
+}
+
+// Qoder CN can wrap a 10605 / RESOURCE_LIMIT queue notice inside two nested
+// JSON message strings under a 403 SSE frame. That must surface as
+// upstream_busy with RetryAfterSeconds rather than reauth_required.
+func TestNestedResourceLimitQueueFrameIsNotALapsedSignIn(t *testing.T) {
+	frame := `data:{"headers":{"Content-Type":["application/json"],"Retry-After":["60"]},"body":"{\"code\":\"403\",\"message\":\"{\\\"code\\\":\\\"10605\\\",\\\"message\\\":\\\"{\\\\\\\"errorCode\\\\\\\":0,\\\\\\\"isQueued\\\\\\\":true,\\\\\\\"modelKey\\\\\\\":\\\\\\\"dfmodel\\\\\\\",\\\\\\\"queueCount\\\\\\\":1,\\\\\\\"queueType\\\\\\\":\\\\\\\"p4\\\\\\\",\\\\\\\"retryAfterSeconds\\\\\\\":60,\\\\\\\"serviceAvailable\\\\\\\":true,\\\\\\\"subCode\\\\\\\":\\\\\\\"RESOURCE_LIMIT\\\\\\\",\\\\\\\"waitTime\\\\\\\":60}\\\",\\\"subCode\\\":\\\"RESOURCE_LIMIT\\\"}\"}","statusCodeValue":403,"statusCode":"FORBIDDEN"}` + "\n\n"
+	events := newQoderEvents(nil)
+	out := events.feed([]byte(frame))
+	if len(out) != 1 || out[0].Err == nil {
+		t.Fatalf("events = %+v", out)
+	}
+	f := out[0].Err
+	if f.Status != http.StatusServiceUnavailable || f.Lapsed || !f.Queue || f.CredentialScoped || f.Code != queuedCode || f.RetryAfter != 60 {
+		t.Fatalf("failure = %+v", f)
+	}
+	if !strings.Contains(f.Message, "dfmodel") || !strings.Contains(f.Message, "60s") {
+		t.Fatalf("message = %q", f.Message)
+	}
+	var perr *pluginabi.Error
+	if err := decisionError(f); !errors.As(err, &perr) {
+		t.Fatalf("decisionError = %#v", err)
+	} else if perr.Code != "upstream_busy" || perr.HTTPStatus != http.StatusServiceUnavailable || perr.RetryAfterSeconds != 60 || perr.CredentialScoped {
+		t.Fatalf("plugin error = %+v", perr)
+	}
+}
+
+func TestClassifyUpstreamUnwrapsNestedJSON(t *testing.T) {
+	nestedQueueBody := `{"code":"403","message":"{\"code\":\"10605\",\"message\":\"{\\\"errorCode\\\":0,\\\"isQueued\\\":true,\\\"modelKey\\\":\\\"qmodel_latest\\\",\\\"queueCount\\\":1,\\\"queueType\\\":\\\"p4\\\",\\\"retryAfterSeconds\\\":60,\\\"serviceAvailable\\\":true,\\\"subCode\\\":\\\"RESOURCE_LIMIT\\\",\\\"waitTime\\\":60}\",\"subCode\":\"RESOURCE_LIMIT\"}"}`
+	wholeEnvelope := `{"headers":{"Content-Type":["application/json"],"Retry-After":["60"]},"body":` + mustJSON(nestedQueueBody) + `,"statusCodeValue":403,"statusCode":"FORBIDDEN"}`
+
+	cases := []struct {
+		name           string
+		status         int
+		headers        http.Header
+		body           string
+		wantStatus     int
+		wantCode       string
+		wantQueue      bool
+		wantLapsed     bool
+		wantRetryAfter int
+		wantSubstr     string
+	}{
+		{
+			name:           "double-encoded 403 queue payload",
+			status:         403,
+			headers:        http.Header{"Retry-After": {"60"}},
+			body:           nestedQueueBody,
+			wantStatus:     503,
+			wantCode:       queuedCode,
+			wantQueue:      true,
+			wantRetryAfter: 60,
+			wantSubstr:     "qmodel_latest",
+		},
+		{
+			name:           "whole envelope body with headers",
+			status:         403,
+			body:           wholeEnvelope,
+			wantStatus:     503,
+			wantCode:       queuedCode,
+			wantQueue:      true,
+			wantRetryAfter: 60,
+			wantSubstr:     "qmodel_latest",
+		},
+		{
+			name:           "nested RESOURCE_LIMIT uses Retry-After header",
+			status:         403,
+			headers:        http.Header{"retry-after": {"45"}},
+			body:           `{"code":"403","message":"{\"subCode\":\"RESOURCE_LIMIT\",\"message\":\"busy\"}"}`,
+			wantStatus:     503,
+			wantCode:       queuedCode,
+			wantQueue:      true,
+			wantRetryAfter: 45,
+			wantSubstr:     "45s",
+		},
+		{
+			name:           "nested waitTime fallback without retryAfterSeconds",
+			status:         403,
+			body:           `{"code":"403","message":"{\"isQueued\":true,\"modelKey\":\"dfmodel\",\"waitTime\":25}"}`,
+			wantStatus:     503,
+			wantCode:       queuedCode,
+			wantQueue:      true,
+			wantRetryAfter: 25,
+			wantSubstr:     "25s",
+		},
+		{
+			name:       "nested 145 allowance stays 429 not lapsed",
+			status:     403,
+			body:       `{"code":"403","message":"{\"code\":\"145\",\"subCode\":\"MODEL_PAID_CONFIRM_REQUIRED\",\"message\":\"Daily allowance exhausted.\"}"}`,
+			wantStatus: 429,
+			wantCode:   allowanceCode,
+			wantSubstr: "Daily allowance",
+		},
+		{
+			name:       "nested 105 still marks sign-in lapsed",
+			status:     403,
+			body:       `{"code":"403","message":"{\"code\":\"105\",\"message\":\"Login expired\"}"}`,
+			wantStatus: 401,
+			wantCode:   "105",
+			wantLapsed: true,
+			wantSubstr: "sign in again",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := classifyUpstream(tc.status, tc.headers, []byte(tc.body))
+			if got.Status != tc.wantStatus || got.Code != tc.wantCode || got.Queue != tc.wantQueue || got.Lapsed != tc.wantLapsed || got.RetryAfter != tc.wantRetryAfter {
+				t.Fatalf("got = %+v", got)
+			}
+			if tc.wantSubstr != "" && !strings.Contains(got.Message, tc.wantSubstr) {
+				t.Fatalf("message = %q, want %q", got.Message, tc.wantSubstr)
+			}
+		})
+	}
+}
+
+func TestSSEFrameHeadersCarryRetryAfter(t *testing.T) {
+	frame := "data:" + mustJSON(map[string]any{
+		"statusCodeValue": 403,
+		"headers":         map[string][]string{"retry-after": {"75"}},
+		"body":            `{"code":"403","message":"{\"code\":\"10605\",\"subCode\":\"RESOURCE_LIMIT\",\"message\":\"queued\"}"}`,
+	}) + "\n\n"
+	out := newQoderEvents(nil).feed([]byte(frame))
+	if len(out) != 1 || out[0].Err == nil {
+		t.Fatalf("events = %+v", out)
+	}
+	f := out[0].Err
+	if f.Status != 503 || !f.Queue || f.Lapsed || f.RetryAfter != 75 {
+		t.Fatalf("failure = %+v", f)
 	}
 }

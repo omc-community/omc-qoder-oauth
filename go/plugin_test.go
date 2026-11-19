@@ -933,6 +933,69 @@ func TestExecuteDoesNotRetryOtherRefusals(t *testing.T) {
 	}
 }
 
+// A double-encoded 403 frame carrying 10605 / RESOURCE_LIMIT is a queue refusal
+// on both buffered and streaming paths: it surfaces as upstream_busy with its
+// retry window and does not trigger a lapsed-token retry.
+func TestNestedResourceLimitQueueFrameDoesNotRetryOrForceReauth(t *testing.T) {
+	resetListingCache()
+	frame := `data:{"headers":{"Content-Type":["application/json"],"Retry-After":["60"]},"body":"{\"code\":\"403\",\"message\":\"{\\\"code\\\":\\\"10605\\\",\\\"message\\\":\\\"{\\\\\\\"errorCode\\\\\\\":0,\\\\\\\"isQueued\\\\\\\":true,\\\\\\\"modelKey\\\\\\\":\\\\\\\"dfmodel\\\\\\\",\\\\\\\"queueCount\\\\\\\":1,\\\\\\\"queueType\\\\\\\":\\\\\\\"p4\\\\\\\",\\\\\\\"retryAfterSeconds\\\\\\\":60,\\\\\\\"serviceAvailable\\\\\\\":true,\\\\\\\"subCode\\\\\\\":\\\\\\\"RESOURCE_LIMIT\\\\\\\",\\\\\\\"waitTime\\\\\\\":60}\\\",\\\"subCode\\\":\\\"RESOURCE_LIMIT\\\"}\"}","statusCodeValue":403,"statusCode":"FORBIDDEN"}` + "\n\n"
+	payload := []byte(`{"model":"deepseek-flash","messages":[{"role":"user","content":"hi"}]}`)
+
+	t.Run("buffered", func(t *testing.T) {
+		chats := 0
+		sender := &fakeSender{reply: func(r pluginapi.HTTPRequest) (pluginapi.HTTPResponse, error) {
+			if strings.Contains(r.URL, "/model/list") {
+				return jsonResponse(`{"app":[{"key":"dfmodel","display_name":"DeepSeek-Flash","enable":true}]}`), nil
+			}
+			chats++
+			return pluginapi.HTTPResponse{StatusCode: 200, Body: []byte(frame)}, nil
+		}}
+		_, err := execute(pluginapi.ExecutorRequest{Model: "deepseek-flash", Payload: payload, StorageJSON: testCredential(siteQoderCN), AuthID: "a"}, sender)
+		var perr *pluginabi.Error
+		if !errors.As(err, &perr) {
+			t.Fatalf("err = %#v", err)
+		}
+		if perr.Code != "upstream_busy" || perr.HTTPStatus != http.StatusServiceUnavailable || perr.RetryAfterSeconds != 60 || perr.CredentialScoped {
+			t.Fatalf("plugin error = %+v", perr)
+		}
+		if chats != 1 {
+			t.Fatalf("chat calls = %d, want 1", chats)
+		}
+	})
+
+	t.Run("streaming", func(t *testing.T) {
+		origRead, origOpen := readStreamChunk, openHTTPStream
+		t.Cleanup(func() { readStreamChunk, openHTTPStream = origRead, origOpen })
+		opened := 0
+		openHTTPStream = func(plan requestPlan, callbackID string) (hostStreamResponse, error) {
+			opened++
+			return hostStreamResponse{StatusCode: 200, StreamID: "queued-stream"}, nil
+		}
+		sent := false
+		readStreamChunk = func(id string) (hostReadResponse, error) {
+			if sent {
+				return hostReadResponse{Done: true}, nil
+			}
+			sent = true
+			return hostReadResponse{Payload: []byte(frame)}, nil
+		}
+		sender := &fakeSender{reply: func(r pluginapi.HTTPRequest) (pluginapi.HTTPResponse, error) {
+			return jsonResponse(`{"app":[{"key":"dfmodel","display_name":"DeepSeek-Flash","enable":true}]}`), nil
+		}}
+		_, err := executeStream(pluginapi.ExecutorRequest{Model: "deepseek-flash", Payload: payload, StorageJSON: testCredential(siteQoderCN), AuthID: "a"}, "", "target", sender)
+		var perr *pluginabi.Error
+		if !errors.As(err, &perr) {
+			t.Fatalf("err = %#v", err)
+		}
+		if perr.Code != "upstream_busy" || perr.HTTPStatus != http.StatusServiceUnavailable || perr.RetryAfterSeconds != 60 || perr.CredentialScoped {
+			t.Fatalf("plugin error = %+v", perr)
+		}
+		if opened != 1 {
+			t.Fatalf("stream opens = %d, want 1", opened)
+		}
+	})
+}
+
 // A lapsed token can arrive inside an OK stream instead of as a status; the
 // stream is opened again with the device token rather than answered with 401.
 func TestStreamRetriesWithDeviceTokenWhenSignInLapsed(t *testing.T) {
